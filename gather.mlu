@@ -5,13 +5,15 @@
 
 __mlu_entry__ void gather_kernel(const half *x, const int *indices, const half *weights, half *out,
                                  int items, int hidden, int top_k) {
-    int total = items * hidden;
-    for (int p = taskId; p < total; p += taskDim) {
-        int item = p / hidden;
-        int h = p - item * hidden;
-        int src = indices[item] / top_k;
-        float v = __half2float(x[src * hidden + h]) * __half2float(weights[indices[item]]);
-        out[p] = (half)v;
+    if (taskId == 0) {
+        int total = items * hidden;
+        for (int p = 0; p < total; ++p) {
+            int item = p / hidden;
+            int h = p - item * hidden;
+            int src = indices[item] / top_k;
+            float v = __half2float(x[src * hidden + h]) * __half2float(weights[indices[item]]);
+            out[p] = (half)v;
+        }
     }
 }
 
@@ -22,8 +24,8 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices, torch::Tensor bi
     int hidden = x.size(1);
     auto out = torch::empty({x.size(0) * top_k, hidden}, x.options());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t launch = {256, 1, 1};
-    gather_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+    cnrtDim3_t launch = {1, 1, 1};
+    gather_kernel<<<launch, cnrtFuncTypeBlock, queue>>>(
         (half *)x.data_ptr<at::Half>(), indices.data_ptr<int>(), (half *)weights.data_ptr<at::Half>(),
         (half *)out.data_ptr<at::Half>(), items, hidden, top_k);
     return out;
