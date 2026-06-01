@@ -5,7 +5,7 @@
 
 #define BMM_TM 32
 #define BMM_TN 512
-#define BMM_BATCH_CHUNK 2
+#define BMM_BATCH_CHUNK 16
 
 __mlu_entry__ void bmm_kernel(
     const half *A, const half *B, float *C,
