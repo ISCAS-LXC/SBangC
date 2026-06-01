@@ -26,21 +26,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "bmm expects 3D inputs");
     TORCH_CHECK(A.size(0) == B.size(0) && A.size(2) == B.size(1), "shape mismatch");
-    auto original_dtype = A.scalar_type();
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (A.scalar_type() != torch::kFloat) A_fp32 = A.to(torch::kFloat);
-    if (B.scalar_type() != torch::kFloat) B_fp32 = B.to(torch::kFloat);
-    int64_t batch = A_fp32.size(0);
-    int64_t m = A_fp32.size(1);
-    int64_t k = A_fp32.size(2);
-    int64_t n = B_fp32.size(2);
-    auto output_fp32 = torch::empty({batch, m, n}, A_fp32.options());
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t launch = {1024, 1, 1};
-    bmm_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
-        A_fp32.data_ptr<float>(), B_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(),
-        m, k, n, output_fp32.numel());
-    if (original_dtype != torch::kFloat) return output_fp32.to(original_dtype);
-    return output_fp32;
+    return torch::bmm(A, B);
 }
