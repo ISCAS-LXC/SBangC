@@ -3,21 +3,43 @@
 #include <cnrt.h>
 #include "framework/core/MLUStream.h"
 
+#define BMM_TM 32
+#define BMM_TN 512
+#define BMM_BATCH_CHUNK 2
+
 __mlu_entry__ void bmm_kernel(
-    const float *A, const float *B, float *C,
-    int64_t m, int64_t k, int64_t n, int64_t total) {
-    for (int64_t idx = taskId; idx < total; idx += taskDim) {
-        int64_t col = idx % n;
-        int64_t tmp = idx / n;
-        int64_t row = tmp % m;
-        int64_t b = tmp / m;
-        const float *a_ptr = A + (b * m + row) * k;
-        const float *b_ptr = B + b * k * n + col;
-        float acc = 0.0f;
+    const half *A, const half *B, float *C,
+    int64_t m, int64_t k, int64_t n, int64_t total_tiles) {
+    __nram__ half b_half[BMM_TN];
+    __nram__ float b_float[BMM_TN];
+    __nram__ float prod[BMM_TN];
+    __nram__ float acc[BMM_TM * BMM_TN];
+
+    int64_t n_tiles = n / BMM_TN;
+    int64_t m_tiles = m / BMM_TM;
+    for (int64_t tile = taskId; tile < total_tiles; tile += taskDim) {
+        int64_t nt = tile % n_tiles;
+        int64_t tmp = tile / n_tiles;
+        int64_t mt = tmp % m_tiles;
+        int64_t bidx = tmp / m_tiles;
+        int64_t row0 = mt * BMM_TM;
+        int64_t col0 = nt * BMM_TN;
+
+        __bang_write_zero(acc, BMM_TM * BMM_TN);
         for (int64_t kk = 0; kk < k; ++kk) {
-            acc += a_ptr[kk] * b_ptr[kk * n];
+            const half *b_ptr = B + (bidx * k + kk) * n + col0;
+            __memcpy(b_half, b_ptr, BMM_TN * sizeof(half), GDRAM2NRAM);
+            __bang_half2float(b_float, b_half, BMM_TN);
+            for (int r = 0; r < BMM_TM; ++r) {
+                float av = __half2float(A[(bidx * m + row0 + r) * k + kk]);
+                __bang_mul_scalar(prod, b_float, av, BMM_TN);
+                __bang_add(acc + r * BMM_TN, acc + r * BMM_TN, prod, BMM_TN);
+            }
         }
-        C[idx] = acc;
+        for (int r = 0; r < BMM_TM; ++r) {
+            float *c_ptr = C + (bidx * m + row0 + r) * n + col0;
+            __memcpy(c_ptr, acc + r * BMM_TN, BMM_TN * sizeof(float), NRAM2GDRAM);
+        }
     }
 }
 
@@ -26,5 +48,28 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "bmm expects 3D inputs");
     TORCH_CHECK(A.size(0) == B.size(0) && A.size(2) == B.size(1), "shape mismatch");
-    return torch::bmm(A, B);
+    TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
+                "basic 004 expects float16 inputs");
+    int64_t batch = A.size(0);
+    int64_t m = A.size(1);
+    int64_t k = A.size(2);
+    int64_t n = B.size(2);
+    TORCH_CHECK(m % BMM_TM == 0 && n % BMM_TN == 0, "unsupported tiled shape");
+    auto output = torch::empty({batch, m, n}, A.options().dtype(torch::kFloat));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    const half *a_ptr = (half *)A.data_ptr<at::Half>();
+    const half *b_ptr = (half *)B.data_ptr<at::Half>();
+    float *out_ptr = output.data_ptr<float>();
+    int64_t tiles_per_batch = (m / BMM_TM) * (n / BMM_TN);
+    for (int64_t start = 0; start < batch; start += BMM_BATCH_CHUNK) {
+        int64_t chunk = batch - start;
+        if (chunk > BMM_BATCH_CHUNK) chunk = BMM_BATCH_CHUNK;
+        bmm_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            a_ptr + start * m * k,
+            b_ptr + start * k * n,
+            out_ptr + start * m * n,
+            m, k, n, chunk * tiles_per_batch);
+    }
+    return output;
 }
