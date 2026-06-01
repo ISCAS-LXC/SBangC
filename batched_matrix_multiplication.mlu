@@ -3,9 +3,9 @@
 #include <cnrt.h>
 #include "framework/core/MLUStream.h"
 
-#define BMM_TM 32
-#define BMM_TN 512
-#define BMM_BATCH_CHUNK 16
+#define BMM_TM 64
+#define BMM_TN 1024
+#define BMM_BATCH_CHUNK 64
 
 __mlu_entry__ void bmm_kernel(
     const half *A, const half *B, float *C,
