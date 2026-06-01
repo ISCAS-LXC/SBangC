@@ -1,0 +1,73 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void logsoftmax_dim1_kernel(
+    const float *input, float *output, int64_t rows, int64_t cols) {
+    for (int64_t row = taskId; row < rows; row += taskDim) {
+        const float *in = input + row * cols;
+        float *out = output + row * cols;
+        float max_val = in[0];
+        for (int64_t c = 1; c < cols; ++c) {
+            float v = in[c];
+            if (v > max_val) max_val = v;
+        }
+        float sum_val = 0.0f;
+        for (int64_t c = 0; c < cols; ++c) {
+            sum_val += expf(in[c] - max_val);
+        }
+        float log_sum = logf(sum_val) + max_val;
+        for (int64_t c = 0; c < cols; ++c) {
+            out[c] = in[c] - log_sum;
+        }
+    }
+}
+
+__mlu_entry__ void logsoftmax_dim0_kernel(
+    const float *input, float *output, int64_t rows, int64_t cols) {
+    for (int64_t col = taskId; col < cols; col += taskDim) {
+        float max_val = input[col];
+        for (int64_t r = 1; r < rows; ++r) {
+            float v = input[r * cols + col];
+            if (v > max_val) max_val = v;
+        }
+        float sum_val = 0.0f;
+        for (int64_t r = 0; r < rows; ++r) {
+            sum_val += expf(input[r * cols + col] - max_val);
+        }
+        float log_sum = logf(sum_val) + max_val;
+        for (int64_t r = 0; r < rows; ++r) {
+            output[r * cols + col] = input[r * cols + col] - log_sum;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim_arg) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "LogSoftmax expects a 2D tensor");
+    if (dim_arg < 0) dim_arg += 2;
+    TORCH_CHECK(dim_arg == 0 || dim_arg == 1, "unsupported dim");
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+    auto output_fp32 = torch::empty_like(x_fp32);
+    int64_t rows = x_fp32.size(0);
+    int64_t cols = x_fp32.size(1);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {256, 1, 1};
+    if (dim_arg == 1) {
+        logsoftmax_dim1_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(), rows, cols);
+    } else {
+        logsoftmax_dim0_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(), rows, cols);
+    }
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}

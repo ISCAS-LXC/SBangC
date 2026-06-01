@@ -1,0 +1,34 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void matrix_scalar_kernel(
+    const float *input, float *output, int64_t total, float scale) {
+    int64_t tid = taskId;
+    int64_t step = taskDim;
+    for (int64_t i = tid; i < total; i += step) {
+        output[i] = input[i] * scale;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, double s) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    auto original_dtype = A.scalar_type();
+    torch::Tensor A_fp32 = A;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+    auto output_fp32 = torch::empty_like(A_fp32);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {256, 1, 1};
+    matrix_scalar_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
+        A_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        A_fp32.numel(),
+        (float)s);
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}

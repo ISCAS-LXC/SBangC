@@ -1,0 +1,95 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void batchnorm_partial_stats_kernel(
+    const float *x, float *partial_sum, float *partial_sumsq,
+    int64_t N, int64_t C, int64_t H, int64_t W, int64_t parts) {
+    int64_t plane = H * W;
+    int64_t count = N * plane;
+    int64_t total = C * parts;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t part = idx % parts;
+        int64_t c = idx / parts;
+        int64_t start = part * count / parts;
+        int64_t end = (part + 1) * count / parts;
+        float sum = 0.0f;
+        float sumsq = 0.0f;
+        for (int64_t t = start; t < end; ++t) {
+            int64_t n = t / plane;
+            int64_t i = t - n * plane;
+            int64_t base = (n * C + c) * plane;
+            float v = x[base + i];
+            sum += v;
+            sumsq += v * v;
+        }
+        partial_sum[idx] = sum;
+        partial_sumsq[idx] = sumsq;
+    }
+}
+
+__mlu_entry__ void batchnorm_finalize_stats_kernel(
+    const float *partial_sum, const float *partial_sumsq,
+    float *mean, float *invstd,
+    int64_t N, int64_t C, int64_t H, int64_t W, int64_t parts, float eps) {
+    int64_t count = N * H * W;
+    for (int64_t c = taskId; c < C; c += taskDim) {
+        float sum = 0.0f;
+        float sumsq = 0.0f;
+        for (int64_t p = 0; p < parts; ++p) {
+            int64_t idx = c * parts + p;
+            sum += partial_sum[idx];
+            sumsq += partial_sumsq[idx];
+        }
+        float m = sum / (float)count;
+        float var = sumsq / (float)count - m * m;
+        if (var < 0.0f) var = 0.0f;
+        mean[c] = m;
+        invstd[c] = 1.0f / sqrtf(var + eps);
+    }
+}
+
+__mlu_entry__ void batchnorm_apply_kernel(
+    const float *x, float *out, const float *mean, const float *invstd,
+    int64_t C, int64_t H, int64_t W, int64_t total) {
+    int64_t plane = H * W;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t c = (idx / plane) % C;
+        out[idx] = (x[idx] - mean[c]) * invstd[c];
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "BatchNorm expects a 4D tensor");
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) x_fp32 = x.to(torch::kFloat);
+    int64_t N = x_fp32.size(0);
+    int64_t C = x_fp32.size(1);
+    int64_t H = x_fp32.size(2);
+    int64_t W = x_fp32.size(3);
+    TORCH_CHECK(C == num_features, "num_features mismatch");
+    auto output_fp32 = torch::empty_like(x_fp32);
+    auto mean = torch::empty({C}, x_fp32.options());
+    auto invstd = torch::empty({C}, x_fp32.options());
+    int64_t parts = 256;
+    auto partial_sum = torch::empty({C, parts}, x_fp32.options());
+    auto partial_sumsq = torch::empty({C, parts}, x_fp32.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t stats_launch = {1024, 1, 1};
+    cnrtDim3_t apply_launch = {1024, 1, 1};
+    batchnorm_partial_stats_kernel<<<stats_launch, cnrtFuncTypeUnion1, queue>>>(
+        x_fp32.data_ptr<float>(), partial_sum.data_ptr<float>(), partial_sumsq.data_ptr<float>(),
+        N, C, H, W, parts);
+    batchnorm_finalize_stats_kernel<<<stats_launch, cnrtFuncTypeUnion1, queue>>>(
+        partial_sum.data_ptr<float>(), partial_sumsq.data_ptr<float>(),
+        mean.data_ptr<float>(), invstd.data_ptr<float>(), N, C, H, W, parts, 1e-5f);
+    batchnorm_apply_kernel<<<apply_launch, cnrtFuncTypeUnion1, queue>>>(
+        x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(), mean.data_ptr<float>(), invstd.data_ptr<float>(),
+        C, H, W, output_fp32.numel());
+    if (original_dtype != torch::kFloat) return output_fp32.to(original_dtype);
+    return output_fp32;
+}

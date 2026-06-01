@@ -1,0 +1,90 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void argmax_dim1_kernel(
+    const float *x, int64_t *out, int64_t B, int64_t D1, int64_t D2, int64_t total) {
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t d2 = idx % D2;
+        int64_t b = idx / D2;
+        int64_t base = b * D1 * D2 + d2;
+        float best = x[base];
+        int64_t best_i = 0;
+        for (int64_t i = 1; i < D1; ++i) {
+            float v = x[base + i * D2];
+            if (v > best) {
+                best = v;
+                best_i = i;
+            }
+        }
+        out[idx] = best_i;
+    }
+}
+
+__mlu_entry__ void argmax_dim2_kernel(
+    const float *x, int64_t *out, int64_t B, int64_t D1, int64_t D2, int64_t total) {
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t d1 = idx % D1;
+        int64_t b = idx / D1;
+        int64_t base = (b * D1 + d1) * D2;
+        float best = x[base];
+        int64_t best_i = 0;
+        for (int64_t i = 1; i < D2; ++i) {
+            float v = x[base + i];
+            if (v > best) {
+                best = v;
+                best_i = i;
+            }
+        }
+        out[idx] = best_i;
+    }
+}
+
+__mlu_entry__ void argmax_dim0_kernel(
+    const float *x, int64_t *out, int64_t B, int64_t D1, int64_t D2, int64_t total) {
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t d2 = idx % D2;
+        int64_t d1 = idx / D2;
+        int64_t base = d1 * D2 + d2;
+        float best = x[base];
+        int64_t best_i = 0;
+        for (int64_t b = 1; b < B; ++b) {
+            float v = x[b * D1 * D2 + base];
+            if (v > best) {
+                best = v;
+                best_i = b;
+            }
+        }
+        out[idx] = best_i;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim_arg) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "argmax implementation expects a 3D tensor");
+    if (dim_arg < 0) dim_arg += 3;
+    TORCH_CHECK(dim_arg >= 0 && dim_arg < 3, "unsupported dim");
+    torch::Tensor x_fp32 = x;
+    if (x.scalar_type() != torch::kFloat) x_fp32 = x.to(torch::kFloat);
+    int64_t B = x_fp32.size(0);
+    int64_t D1 = x_fp32.size(1);
+    int64_t D2 = x_fp32.size(2);
+    torch::Tensor out;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    if (dim_arg == 1) {
+        out = torch::empty({B, D2}, x.options().dtype(torch::kLong));
+        argmax_dim1_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            x_fp32.data_ptr<float>(), out.data_ptr<int64_t>(), B, D1, D2, out.numel());
+    } else if (dim_arg == 2) {
+        out = torch::empty({B, D1}, x.options().dtype(torch::kLong));
+        argmax_dim2_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            x_fp32.data_ptr<float>(), out.data_ptr<int64_t>(), B, D1, D2, out.numel());
+    } else {
+        out = torch::empty({D1, D2}, x.options().dtype(torch::kLong));
+        argmax_dim0_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+            x_fp32.data_ptr<float>(), out.data_ptr<int64_t>(), B, D1, D2, out.numel());
+    }
+    return out;
+}

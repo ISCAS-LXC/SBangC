@@ -1,0 +1,52 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void avg_pool2d_kernel(
+    const float *x, float *out,
+    int64_t C, int64_t H, int64_t W, int64_t K,
+    int64_t OH, int64_t OW, int64_t total) {
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t ow = idx % OW;
+        int64_t tmp = idx / OW;
+        int64_t oh = tmp % OH;
+        tmp /= OH;
+        int64_t c = tmp % C;
+        int64_t n = tmp / C;
+        int64_t base = ((n * C + c) * H) * W;
+        int64_t ih0 = oh * K;
+        int64_t iw0 = ow * K;
+        float acc = 0.0f;
+        for (int64_t kh = 0; kh < K; ++kh) {
+            int64_t in_row = base + (ih0 + kh) * W + iw0;
+            for (int64_t kw = 0; kw < K; ++kw) {
+                acc += x[in_row + kw];
+            }
+        }
+        out[idx] = acc / (float)(K * K);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "avg_pool2d expects a 4D tensor");
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) x_fp32 = x.to(torch::kFloat);
+    int64_t N = x_fp32.size(0);
+    int64_t C = x_fp32.size(1);
+    int64_t H = x_fp32.size(2);
+    int64_t W = x_fp32.size(3);
+    int64_t K = kernel_size;
+    int64_t OH = (H - K) / K + 1;
+    int64_t OW = (W - K) / K + 1;
+    auto output_fp32 = torch::empty({N, C, OH, OW}, x_fp32.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    avg_pool2d_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(),
+        C, H, W, K, OH, OW, output_fp32.numel());
+    if (original_dtype != torch::kFloat) return output_fp32.to(original_dtype);
+    return output_fp32;
+}

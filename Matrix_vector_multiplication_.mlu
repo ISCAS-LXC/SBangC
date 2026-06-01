@@ -1,0 +1,63 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void gemv_partial_kernel(
+    const float *A, const float *B, float *partial,
+    int64_t M, int64_t K, int64_t parts) {
+    int64_t total = M * parts;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int64_t part = idx % parts;
+        int64_t row = idx / parts;
+        int64_t start = part * K / parts;
+        int64_t end = (part + 1) * K / parts;
+        const float *a = A + row * K;
+        float acc = 0.0f;
+        float comp = 0.0f;
+        for (int64_t k = start; k < end; ++k) {
+            float y = a[k] * B[k] - comp;
+            float t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+        }
+        partial[idx] = acc;
+    }
+}
+
+__mlu_entry__ void gemv_reduce_kernel(
+    const float *partial, float *out, int64_t M, int64_t parts) {
+    for (int64_t row = taskId; row < M; row += taskDim) {
+        float acc = 0.0f;
+        float comp = 0.0f;
+        for (int64_t p = 0; p < parts; ++p) {
+            float y = partial[row * parts + p] - comp;
+            float t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+        }
+        out[row] = acc;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    auto original_dtype = A.scalar_type();
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A.scalar_type() != torch::kFloat) A_fp32 = A.to(torch::kFloat);
+    if (B.scalar_type() != torch::kFloat) B_fp32 = B.to(torch::kFloat);
+    int64_t M = A_fp32.size(0);
+    int64_t K = A_fp32.size(1);
+    int64_t parts = 32;
+    auto output_fp32 = torch::empty({M, (int64_t)1}, A_fp32.options());
+    auto partial = torch::empty({M, parts}, A_fp32.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    gemv_partial_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        A_fp32.data_ptr<float>(), B_fp32.data_ptr<float>(), partial.data_ptr<float>(), M, K, parts);
+    gemv_reduce_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        partial.data_ptr<float>(), output_fp32.data_ptr<float>(), M, parts);
+    return output_fp32;
+}
