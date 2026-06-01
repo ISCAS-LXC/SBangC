@@ -1,0 +1,35 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void kl_part_kernel(const half *inp, const half *target, float *part, int64_t total) {
+    float acc = 0.0f;
+    for (int64_t i = taskId; i < total; i += taskDim) {
+        float t = __half2float(target[i]);
+        float x = __half2float(inp[i]);
+        if (t > 0.0f) acc += t * (logf(t) - x);
+    }
+    part[taskId] = acc;
+}
+
+__mlu_entry__ void kl_reduce_kernel(const float *part, float *out, int n, int batch) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) acc += part[i];
+    out[0] = acc / (float)batch;
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+    int tasks = 1024;
+    auto part = torch::empty({tasks}, input_log_prob.options().dtype(torch::kFloat));
+    auto out = torch::empty({}, input_log_prob.options().dtype(torch::kFloat));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    kl_part_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)input_log_prob.data_ptr<at::Half>(), (half *)target_prob.data_ptr<at::Half>(),
+        part.data_ptr<float>(), input_log_prob.numel());
+    cnrtDim3_t one = {1, 1, 1};
+    kl_reduce_kernel<<<one, cnrtFuncTypeBlock, queue>>>(part.data_ptr<float>(), out.data_ptr<float>(), tasks, input_log_prob.size(0));
+    return out;
+}

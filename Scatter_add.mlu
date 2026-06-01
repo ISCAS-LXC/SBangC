@@ -1,0 +1,30 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void scatter_zero_kernel(float *out, int total) {
+    for (int i = taskId; i < total; i += taskDim) out[i] = 0.0f;
+}
+
+__mlu_entry__ void scatter_add_kernel(const half *src, const int64_t *index, float *out, int n, int d) {
+    int total = n * d;
+    for (int p = taskId; p < total; p += taskDim) {
+        int row = p / d;
+        int col = p - row * d;
+        int dst = (int)index[row];
+        __bang_atomic_add(out + dst * d + col, out + dst * d + col, __half2float(src[p]));
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
+    int n = src.size(0);
+    int d = src.size(1);
+    auto out = torch::empty({dim_size, d}, src.options().dtype(torch::kFloat));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    scatter_zero_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(out.data_ptr<float>(), dim_size * d);
+    scatter_add_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)src.data_ptr<at::Half>(), index.data_ptr<int64_t>(), out.data_ptr<float>(), n, d);
+    return out;
+}

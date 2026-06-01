@@ -1,0 +1,33 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void mse_part_kernel(const half *a, const half *b, float *part, int64_t total) {
+    float acc = 0.0f;
+    for (int64_t i = taskId; i < total; i += taskDim) {
+        float d = __half2float(a[i]) - __half2float(b[i]);
+        acc += d * d;
+    }
+    part[taskId] = acc;
+}
+
+__mlu_entry__ void mse_reduce_kernel(const float *part, float *out, int n, int64_t total) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) acc += part[i];
+    out[0] = acc / (float)total;
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    int tasks = 1024;
+    auto part = torch::empty({tasks}, predictions.options().dtype(torch::kFloat));
+    auto out = torch::empty({}, predictions.options().dtype(torch::kFloat));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    mse_part_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)predictions.data_ptr<at::Half>(), (half *)targets.data_ptr<at::Half>(),
+        part.data_ptr<float>(), predictions.numel());
+    cnrtDim3_t one = {1, 1, 1};
+    mse_reduce_kernel<<<one, cnrtFuncTypeBlock, queue>>>(part.data_ptr<float>(), out.data_ptr<float>(), tasks, predictions.numel());
+    return out;
+}

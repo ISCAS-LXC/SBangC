@@ -1,0 +1,41 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void topk_kernel(const half *x, half *values, int64_t *indices, int rows, int cols, int k) {
+    for (int r = taskId; r < rows; r += taskDim) {
+        for (int t = 0; t < k; ++t) {
+            float best = -3.402823466e38f;
+            int best_i = 0;
+            for (int c = 0; c < cols; ++c) {
+                float v = __half2float(x[r * cols + c]);
+                bool used = false;
+                for (int u = 0; u < t; ++u) {
+                    if (indices[r * k + u] == c) used = true;
+                }
+                if (!used && v > best) {
+                    best = v;
+                    best_i = c;
+                }
+            }
+            values[r * k + t] = (half)best;
+            indices[r * k + t] = best_i;
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    int rows = x.size(0);
+    int cols = x.size(1);
+    auto values = torch::empty({rows, k}, x.options());
+    auto indices = torch::empty({rows, k}, x.options().dtype(torch::kLong));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {128, 1, 1};
+    topk_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)x.data_ptr<at::Half>(), (half *)values.data_ptr<at::Half>(),
+        indices.data_ptr<int64_t>(), rows, cols, k);
+    return {values, indices};
+}

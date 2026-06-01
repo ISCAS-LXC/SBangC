@@ -1,0 +1,23 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void sqrt_abs_kernel(const half *x, half *out, int64_t total) {
+    for (int64_t i = taskId; i < total; i += taskDim) {
+        float v = __half2float(x[i]);
+        if (v < 0.0f) v = -v;
+        out[i] = (half)sqrtf(v);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    auto out = torch::empty_like(x);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {1024, 1, 1};
+    sqrt_abs_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)x.data_ptr<at::Half>(), (half *)out.data_ptr<at::Half>(), x.numel());
+    return out;
+}

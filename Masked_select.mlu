@@ -1,0 +1,31 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void mask_select_kernel(const half *input, half *out, int *count, float threshold, int64_t total) {
+    if (taskId == 0) {
+        int pos = 0;
+        for (int64_t i = 0; i < total; ++i) {
+        half hv = input[i];
+        float v = __half2float(hv);
+        if (v > threshold) {
+            out[pos] = hv;
+            ++pos;
+        }
+        count[0] = pos;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+    auto out = torch::empty({input.numel()}, input.options());
+    auto count_t = torch::empty({1}, input.options().dtype(torch::kInt));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t one = {1, 1, 1};
+    mask_select_kernel<<<one, cnrtFuncTypeBlock, queue>>>(
+        (half *)input.data_ptr<at::Half>(), (half *)out.data_ptr<at::Half>(), count_t.data_ptr<int>(),
+        (float)threshold, input.numel());
+    int host_count = 0;
+    cnrtMemcpy(&host_count, count_t.data_ptr<int>(), sizeof(int), cnrtMemcpyDevToHost);
+    return out.slice(0, 0, host_count);
+}

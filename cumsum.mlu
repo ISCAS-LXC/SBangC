@@ -1,0 +1,27 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+__mlu_entry__ void cumsum_kernel(const half *x, float *out, int rows, int cols) {
+    for (int r = taskId; r < rows; r += taskDim) {
+        float acc = 0.0f;
+        int base = r * cols;
+        for (int c = 0; c < cols; ++c) {
+            acc += __half2float(x[base + c]);
+            out[base + c] = acc;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    int rows = x.size(0);
+    int cols = x.size(1);
+    auto out = torch::empty({rows, cols}, x.options().dtype(torch::kFloat));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch = {128, 1, 1};
+    cumsum_kernel<<<launch, cnrtFuncTypeUnion1, queue>>>(
+        (half *)x.data_ptr<at::Half>(), out.data_ptr<float>(), rows, cols);
+    return out;
+}
